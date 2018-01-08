@@ -5,26 +5,25 @@ import util from '../utils/Util';
 import hubUtil from '../utils/HubUtil';
 import repositoryServerActions from '../actions/RepositoryServerActions';
 import tagServerActions from '../actions/TagServerActions';
-import os from 'os';
-var cachedRequest = require('cached-request')(request);
-var cacheDirectory = os.tmpdir() + '/cachekitematic';
-cachedRequest.setCacheDirectory(cacheDirectory);
-cachedRequest.setValue('ttl', 3000);
 
 let REGHUB2_ENDPOINT = process.env.REGHUB2_ENDPOINT || 'https://hub.docker.com/v2';
 let searchReq = null;
 let PAGING = 24;
 
 module.exports = {
+  isDefault: function(){
+    return (REGHUB2_ENDPOINT == 'https://hub.docker.com/v2');
+  },
+
   // Normalizes results from search to v2 repository results
   normalize: function (repo) {
     let obj = _.clone(repo);
     if (obj.is_official) {
       obj.namespace = 'library';
     } else {
-      let [namespace, name] = repo.name.split('/');
-      obj.namespace = namespace;
-      obj.name = name;
+      let parts = repo.name.split('/');
+      obj.name = parts.pop();
+      obj.namespace = parts.join('/');
     }
 
     return obj;
@@ -32,9 +31,7 @@ module.exports = {
 
   search: function (query, page, sorting = null) {
     if (searchReq) {
-      if (searchReq.request) {
-        searchReq.request.abort();
-      }
+      searchReq.abort();
       searchReq = null;
     }
 
@@ -50,32 +47,56 @@ module.exports = {
      * is_official: 1
      */
 
-    searchReq = cachedRequest({
+    REGHUB2_ENDPOINT = process.env.REGHUB2_ENDPOINT || REGHUB2_ENDPOINT;
+    process.env.DOCKER_TLS_VERIFY = "0";
+
+    let is_default = this.isDefault();
+
+    searchReq = request.get(is_default ? {
       url: `${REGHUB2_ENDPOINT}/search/repositories/?`,
       qs: {query: query, page: page, page_size: PAGING, sorting}
+    } : {
+      url: `${REGHUB2_ENDPOINT}/_catalog?n=10000000`
     }, (error, response, body) => {
       if (error) {
         repositoryServerActions.error({error});
       }
 
       let data = JSON.parse(body);
-      let repos = _.map(data.results, result => {
-        result.name = result.repo_name;
-        return this.normalize(result);
-      });
+      if (!is_default) {
+        data.results = data.repositories;
+      }
+      let prefix = is_default ? '' : REGHUB2_ENDPOINT.replace('/v2', '').split('://').pop();
+      let repos = null;
+      if (is_default){
+        repos = _.map(data.results, result => {
+          result.name = result.repo_name;
+          return this.normalize(result);
+        });
+      } else {
+        let i = 0;
+        repos = [];
+        for(i; i < data.results.length; i++){
+          if (data.results[i].indexOf(query) != -1){
+            let str = prefix + '/' + data.results[i];
+            repos.push(this.normalize({repo_name: str, name: str, is_official: false}));
+          }
+        }
+      }
       let next = data.next;
       let previous = data.previous;
       let total = Math.floor(data.count / PAGING);
       if (response.statusCode === 200) {
+        if (!is_default){
+          page = previous = next = total = 1;
+        }
         repositoryServerActions.resultsUpdated({repos, page, previous, next, total});
       }
     });
   },
 
   recommended: function () {
-    cachedRequest({
-      url: 'https://kitematic.com/recommended.json'
-    }, (error, response, body) => {
+    request.get('https://kitematic.com/recommended.json', (error, response, body) => {
       if (error) {
         repositoryServerActions.error({error});
         return;
@@ -94,7 +115,7 @@ module.exports = {
           name = 'library/' + name;
         }
 
-        cachedRequest({
+        request.get({
           url: `${REGHUB2_ENDPOINT}/repositories/${name}`
         }, (error, response, body) => {
           if (error) {
@@ -120,15 +141,29 @@ module.exports = {
   },
 
   tags: function (repo, callback) {
-    hubUtil.request({
-      url: `${REGHUB2_ENDPOINT}/repositories/${repo}/tags`,
-      qs: {page: 1, page_size: 100}
-    }, (error, response, body) => {
+    let is_default = this.isDefault();
+    let repourl = repo;
+    if (!is_default){
+      let parts = repo.split('/');
+      let name = parts.pop();
+      let namespace = parts.pop();
+      repourl = namespace + '/' + name;
+    }
+    hubUtil.request(
+        is_default ?
+        {
+          url: `${REGHUB2_ENDPOINT}/repositories/${repourl}/tags`,
+          qs: {page: 1, page_size: 100}
+        }
+        :
+        {
+          url: `${REGHUB2_ENDPOINT}/${repourl}/tags/list`
+        }, (error, response, body) => {
       if (response.statusCode === 200) {
         let data = JSON.parse(body);
-        tagServerActions.tagsUpdated({repo, tags: data.results || []});
+        tagServerActions.tagsUpdated({repo, tags: (is_default ? data.results : data.tags) || []});
         if (callback) {
-          return callback(null, data.results || []);
+          return callback(null, (is_default ? data.results : data.tags) || []);
         }
       } else {
         repositoryServerActions.error({repo});
@@ -177,7 +212,7 @@ module.exports = {
         });
         // Add current user
         namespaces.push(hubUtil.username());
-      } catch (jsonError) {
+      } catch(jsonError) {
         repositoryServerActions.error({jsonError});
         if (callback) {
           return callback(jsonError);
